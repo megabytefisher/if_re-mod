@@ -57,6 +57,11 @@ __FBSDID("$FreeBSD: src/sys/dev/re/if_re.c,v " RE_VERSION __DATE__ " " __TIME__ 
 
 #include <sys/param.h>
 #include <sys/systm.h>
+/*** MOD START ***/
+#include <sys/bus.h>
+#include <sys/cpuset.h>
+#include <sys/interrupt.h>
+/*** MOD END ***/
 #include <sys/sockio.h>
 #include <sys/mbuf.h>
 #include <sys/malloc.h>
@@ -309,6 +314,24 @@ static driver_t re_driver = {
 static devclass_t re_devclass;
 
 DRIVER_MODULE(if_re, pci, re_driver, re_devclass, 0, 0);
+
+/*** MOD START ***/
+#if OS_VER>=VERSION(7,0)
+static void
+taskqueue_intrp_enqueue(void* arg)
+{
+        struct re_softc* sc = arg;
+	swi_sched(sc->taskqueue_intrp_ih, 0);
+}
+
+static void
+taskqueue_intrp_run(void* arg)
+{
+        struct re_softc* sc = arg;
+	taskqueue_run(sc->taskqueue_intrp);
+}
+#endif
+/*** MOD END ***/
 
 static void
 ClearAndSetEthPhyBit(
@@ -4777,6 +4800,12 @@ static int re_attach(device_t dev)
 //	u_int8_t		data8;
         int     reg;
         int		msic=0, msixc=0;
+        /*** MOD START ***/
+#if OS_VER>=VERSION(7,0)
+        const u_char            *device_name;
+        u_char                  queue_name[20];
+#endif
+        /*** MOD END ***/
 
         /*s = splimp();*/
 
@@ -4982,6 +5011,18 @@ static int re_attach(device_t dev)
         device_printf(dev,"Ethernet address: %6D\n", eaddr, ":");
         printf("\nThis product is covered by one or more of the following patents: \
            \nUS6,570,884, US6,115,776, and US6,327,625.\n");
+
+        /*** MOD START ***/
+#if OS_VER>=VERSION(7,0)
+        // Set up the interrupt processing queue
+        device_name = device_get_nameunit(dev);
+        snprintf(queue_name, sizeof(queue_name), "%s intrp", device_name);
+
+        sc->taskqueue_intrp = taskqueue_create_fast(queue_name, M_WAITOK, taskqueue_intrp_enqueue, sc);
+        swi_add(NULL, queue_name, taskqueue_intrp_run, sc, SWI_TQ_FAST, INTR_MPSAFE, &sc->taskqueue_intrp_ih);
+        device_printf(dev, "Created queue: %s\n", queue_name);
+#endif
+        /*** MOD END ***/
 
         sc->re_unit = unit;
 
@@ -5252,7 +5293,9 @@ static int re_detach(device_t dev)
                 re_stop(sc);
                 RE_UNLOCK(sc);
 #if OS_VER>=VERSION(7,0)
-                taskqueue_drain(taskqueue_fast, &sc->re_inttask);
+                swi_remove(sc->taskqueue_intrp_ih);
+                taskqueue_drain(sc->taskqueue_intrp, &sc->re_inttask);
+                taskqueue_free(sc->taskqueue_intrp);
 #endif
 #if OS_VER < VERSION(4,9)
                 ether_ifdetach(ifp, ETHER_BPF_SUPPORTED);
@@ -8354,9 +8397,9 @@ static int re_intr(void *arg)  	/* Interrupt Handler */
         re_int_task(arg, 0);
 #else //OS_VER < VERSION(7,0)
 #if OS_VER < VERSION(11,0)
-        taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue_fast(sc->taskqueue_intrp, &sc->re_inttask);
 #else ////OS_VER < VERSION(11,0)
-        taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue(sc->taskqueue_intrp, &sc->re_inttask);
 #endif //OS_VER < VERSION(11,0)
         return (FILTER_HANDLED);
 #endif //OS_VER < VERSION(7,0)
@@ -8389,9 +8432,9 @@ static int re_intr_8125(void *arg)  	/* Interrupt Handler */
         re_int_task_8125(arg, 0);
 #else //OS_VER < VERSION(7,0)
 #if OS_VER < VERSION(11,0)
-        taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue_fast(sc->taskqueue_intrp, &sc->re_inttask);
 #else ////OS_VER < VERSION(11,0)
-        taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
+        taskqueue_enqueue(sc->taskqueue_intrp, &sc->re_inttask);
 #endif //OS_VER < VERSION(11,0)
         return (FILTER_HANDLED);
 #endif //OS_VER < VERSION(7,0)
@@ -8403,82 +8446,79 @@ static void re_int_task(void *arg, int npending)
         struct ifnet		*ifp;
         u_int32_t		status;
 
+        /*** MOD START ***/
         sc = arg;
-
-        RE_LOCK(sc);
-
         ifp = RE_GET_IFNET(sc);
 
-        status = CSR_READ_2(sc, RE_ISR);
+        while ((status = CSR_READ_2(sc, RE_ISR)) & RE_INTRS)
+        {
+                RE_LOCK(sc);
 
-        if (status) {
-                CSR_WRITE_2(sc, RE_ISR, status & ~RE_ISR_FIFO_OFLOW);
-        }
-
-        if (sc->suspended ||
-            (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
-                RE_UNLOCK(sc);
-                return;
-        }
-
-        re_rxeof(sc);
-
-        if (sc->re_type == MACFG_21) {
-                if (status & RE_ISR_FIFO_OFLOW) {
-                        sc->rx_fifo_overflow = 1;
-                        CSR_WRITE_2(sc, RE_IntrMitigate, 0x0000);
-                        CSR_WRITE_4(sc, RE_TIMERCNT, 0x4000);
-                        CSR_WRITE_4(sc, RE_TIMERINT, 0x4000);
-                } else {
-                        sc->rx_fifo_overflow = 0;
-                        CSR_WRITE_4(sc,RE_CPlusCmd, 0x51512082);
+                if (status) {
+                        CSR_WRITE_2(sc, RE_ISR, status & ~RE_ISR_FIFO_OFLOW);
                 }
 
-                if (status & RE_ISR_PCS_TIMEOUT) {
-                        if ((status & RE_ISR_FIFO_OFLOW) &&
-                            (!(status & (RE_ISR_RX_OK | RE_ISR_TX_OK | RE_ISR_RX_OVERRUN)))) {
-                                re_reset(sc);
-                                re_init(sc);
+                if (sc->suspended ||
+                (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                        RE_UNLOCK(sc);
+                        return;
+                }
+
+                if ((status & RE_ISR_RX_OK) || (status & RE_ISR_RX_ERR))
+                {
+                        re_rxeof(sc);
+                }
+
+                if (sc->re_type == MACFG_21) {
+                        if (status & RE_ISR_FIFO_OFLOW) {
+                                sc->rx_fifo_overflow = 1;
+                                CSR_WRITE_2(sc, RE_IntrMitigate, 0x0000);
+                                CSR_WRITE_4(sc, RE_TIMERCNT, 0x4000);
+                                CSR_WRITE_4(sc, RE_TIMERINT, 0x4000);
+                        } else {
                                 sc->rx_fifo_overflow = 0;
-                                CSR_WRITE_2(sc, RE_ISR, RE_ISR_FIFO_OFLOW);
+                                CSR_WRITE_4(sc,RE_CPlusCmd, 0x51512082);
+                        }
+
+                        if (status & RE_ISR_PCS_TIMEOUT) {
+                                if ((status & RE_ISR_FIFO_OFLOW) &&
+                                (!(status & (RE_ISR_RX_OK | RE_ISR_TX_OK | RE_ISR_RX_OVERRUN)))) {
+                                        re_reset(sc);
+                                        re_init(sc);
+                                        sc->rx_fifo_overflow = 0;
+                                        CSR_WRITE_2(sc, RE_ISR, RE_ISR_FIFO_OFLOW);
+                                }
                         }
                 }
+
+                if ((status & RE_ISR_TX_OK) || (status & RE_ISR_TX_ERR))
+                {
+                        re_txeof(sc);
+                }
+
+                if (status & RE_ISR_SYSTEM_ERR) {
+                        re_reset(sc);
+                        re_init(sc);
+                }
+
+                switch(sc->re_type) {
+                case MACFG_21:
+                case MACFG_22:
+                case MACFG_23:
+                case MACFG_24:
+                        CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
+                        break;
+
+                default:
+                        break;
+                }
+
+                RE_UNLOCK(sc);
         }
-
-        re_txeof(sc);
-
-        if (status & RE_ISR_SYSTEM_ERR) {
-                re_reset(sc);
-                re_init(sc);
-        }
-
-        switch(sc->re_type) {
-        case MACFG_21:
-        case MACFG_22:
-        case MACFG_23:
-        case MACFG_24:
-                CSR_WRITE_1(sc, RE_TPPOLL, RE_NPQ);
-                break;
-
-        default:
-                break;
-        }
-
-        RE_UNLOCK(sc);
 
         if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
                 re_start(ifp);
-
-#if OS_VER>=VERSION(7,0)
-        if (CSR_READ_2(sc, RE_ISR) & RE_INTRS) {
-#if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
-#else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
-#endif //OS_VER < VERSION(11,0)
-                return;
-        }
-#endif //OS_VER>=VERSION(7,0)
+        /*** MOD END ***/
 
         /* Re-enable interrupts. */
         CSR_WRITE_2(sc, RE_IMR, RE_INTRS);
@@ -8490,48 +8530,41 @@ static void re_int_task_8125(void *arg, int npending)
         struct ifnet		*ifp;
         u_int32_t		status;
 
+        /*** MOD START ***/
         sc = arg;
-
-        RE_LOCK(sc);
-
         ifp = RE_GET_IFNET(sc);
 
-        status = CSR_READ_4(sc, RE_ISR0_8125);
+        while ((status = CSR_READ_4(sc, RE_ISR0_8125)) & RE_INTRS)
+        {
+                RE_LOCK(sc);
 
-        if (status) {
-                CSR_WRITE_4(sc, RE_ISR0_8125, status & ~RE_ISR_FIFO_OFLOW);
-        }
+                status = CSR_READ_4(sc, RE_ISR0_8125);
 
-        if (sc->suspended ||
-            (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                if (status) {
+                        CSR_WRITE_4(sc, RE_ISR0_8125, status & ~RE_ISR_FIFO_OFLOW);
+                }
+
+                if (sc->suspended ||
+                (ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+                        RE_UNLOCK(sc);
+                        return;
+                }
+
+                re_rxeof(sc);
+
+                re_txeof(sc);
+
+                if (status & RE_ISR_SYSTEM_ERR) {
+                        re_reset(sc);
+                        re_init(sc);
+                }
+
                 RE_UNLOCK(sc);
-                return;
         }
-
-        re_rxeof(sc);
-
-        re_txeof(sc);
-
-        if (status & RE_ISR_SYSTEM_ERR) {
-                re_reset(sc);
-                re_init(sc);
-        }
-
-        RE_UNLOCK(sc);
 
         if (!IFQ_DRV_IS_EMPTY(&ifp->if_snd))
                 re_start(ifp);
-
-#if OS_VER>=VERSION(7,0)
-        if (CSR_READ_4(sc, RE_ISR0_8125) & RE_INTRS) {
-#if OS_VER < VERSION(11,0)
-                taskqueue_enqueue_fast(taskqueue_fast, &sc->re_inttask);
-#else ////OS_VER < VERSION(11,0)
-                taskqueue_enqueue(taskqueue_fast, &sc->re_inttask);
-#endif //OS_VER < VERSION(11,0)
-                return;
-        }
-#endif //OS_VER>=VERSION(7,0)
+        /*** MOD END ***/
 
         /* Re-enable interrupts. */
         CSR_WRITE_4(sc, RE_IMR0_8125, RE_INTRS);
